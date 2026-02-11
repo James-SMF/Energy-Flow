@@ -11,24 +11,27 @@ HUD_LINES = 2
 WIDTH = 8 * CELL
 HEIGHT = 8 * CELL + HUD_H * HUD_LINES
 LEADERBOARD_FILE = ".codebuddy/leaderboard.json"
+RESTART_BTN_RECT = (WIDTH - 90, 5, 80, 20)  # 重新开始按钮区域
 
 class Game:
     def __init__(self, screen):
         self.screen = screen
         self.grid = Grid()
-        self.action_points = 50
+        self.action_points = 100
         self.collected_score = 0  # 收集的能量得分
         self.penalty_score = 0  # 惩罚得分
         self.final_score = 0  # 综合得分
         self.selected_tower_type = Cell.G
         self.last_click_time = 0
         self.double_click_time_threshold = 300
-        self.game_state = "playing"  # playing, name_input, leaderboard
+        self.game_state = "playing"  # playing, name_input, leaderboard, viewing_result
         self.player_name = ""
         self.max_name_length = 10
         self.cached_leaderboard = None  # 缓存排行榜数据
         self.needs_redraw = True  # 是否需要重绘
-        
+        self.previous_grid = None  # 保存上一局的grid状态
+        self.previous_scores = None  # 保存上一局的分数
+
         # 初始化中文字体
         self.init_chinese_font()
 
@@ -289,17 +292,14 @@ class Game:
         running = True
         while running:
             clock.tick(60)
-            
+
             if self.game_state == "playing":
                 running = self.handle_events()
-                if self.action_points <= 0 and self.game_state == "playing":
-                    self.game_state = "name_input"
-                    self.needs_redraw = True
                 self.render()
             elif self.game_state == "name_input":
                 # 名字输入状态需要持续渲染（光标闪烁）
                 btn_rect = None
-                
+
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
                         return False
@@ -319,7 +319,7 @@ class Game:
                                     self.cached_leaderboard = self.load_leaderboard()
                                     self.game_state = "leaderboard"
                                     self.needs_redraw = True
-                
+
                 # 持续渲染以显示光标闪烁
                 self.screen.fill((20, 20, 20))
                 self.grid.draw(self.screen, HUD_H * HUD_LINES)
@@ -333,13 +333,29 @@ class Game:
                     self.draw_leaderboard()
                     pygame.display.flip()
                     self.needs_redraw = False
-                
+
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
                         return False
                     elif event.type == pygame.MOUSEBUTTONDOWN:
                         if not self.handle_leaderboard_click(event.pos):
                             return False
+            elif self.game_state == "viewing_result":
+                # 查看上一局结果状态，玩家无法操作
+                if self.needs_redraw:
+                    self.screen.fill((20, 20, 20))
+                    self.grid.draw(self.screen, HUD_H * HUD_LINES)
+                    self.draw_hud()
+                    pygame.display.flip()
+                    self.needs_redraw = False
+
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        return False
+                    elif event.type == pygame.MOUSEBUTTONDOWN:
+                        # 检查是否点击重开按钮
+                        if self.handle_restart_click(event.pos):
+                            return True
 
     def handle_events(self):
         mouse_pos = pygame.mouse.get_pos()
@@ -360,19 +376,18 @@ class Game:
                     mx, my = mouse_pos
                     cell = self.grid.get_cell_by_pixel(mx, my - HUD_H * HUD_LINES)
                     if cell and cell.type in (Cell.G, Cell.A, Cell.C):
-                        old_level = cell.level
-                        cell.upgrade()
-                        if cell.level != old_level:  # 确实升级了
-                            if self.action_points > 0:
-                                self.action_points -= 1
-                            # 重新计算能量传播并更新得分
-                            self.update_scores()
+                        if cell.level < cell.MAX_LEVEL:
+                            ap_cost = 3 * cell.level  # 从n级升级到n+1级消耗 3*n AP
+                            if self.action_points >= ap_cost:
+                                cell.upgrade()
+                                self.action_points -= ap_cost
+                                # 重新计算能量传播并更新得分
+                                self.update_scores()
+                                # 检查是否需要进入结算界面
+                                self.check_game_over()
 
 
             if event.type == pygame.MOUSEBUTTONDOWN:
-                if self.action_points <= 0:
-                    return True
-
                 if event.button == 1:
                     now = pygame.time.get_ticks()
                     delta = now - self.last_click_time
@@ -391,34 +406,99 @@ class Game:
         if not cell or cell.is_obstacle():
             return
 
+        # 检查AP是否足够
+        if self.action_points < 5:
+            return
+
         # Move system
         if cell.is_empty():
             cell.set_tower(self.selected_tower_type)
-            self.action_points -= 1
+            self.action_points -= 5
             # 计算能量传播并更新得分
             self.update_scores()
+            # 检查是否需要进入结算界面
+            self.check_game_over()
 
 
     def update_scores(self):
         """更新各项得分"""
-        collected, wasted = self.grid.calculate_energy_lines()
+        collected, wasted, max_single_waste, total_output = self.grid.calculate_energy_lines()
         self.collected_score = collected
-        self.penalty_score = wasted * 0.2  # 惩罚系数 0.2
+
+        # Penalty = 损失能量 × 系数 × (1 + 0.5 × I_{单次损失>总输出30%})
+        penalty_multiplier = 0.5
+        if total_output > 0 and max_single_waste > total_output * 0.3:
+            penalty_multiplier *= 1.5  # 增加50%惩罚
+
+        self.penalty_score = wasted * penalty_multiplier
         self.final_score = self.collected_score - self.penalty_score
+
+    def get_min_ap_cost(self):
+        """获取当前能执行的最小操作所需的AP"""
+        # 放置新塔：5 AP
+        # 升级塔：最少3 AP（1级升2级）
+        # 移除塔：1 AP
+        return min(5, 3, 1)
+
+    def check_game_over(self):
+        """检查是否应该结束游戏"""
+        min_cost = self.get_min_ap_cost()
+        if self.action_points < min_cost:
+            # 保存当前状态
+            self.save_previous_state()
+            self.game_state = "name_input"
+            self.needs_redraw = True
+
+    def save_previous_state(self):
+        """保存上一局的游戏状态"""
+        # 保存grid状态
+        import copy
+        self.previous_grid = copy.deepcopy(self.grid)
+        # 保存分数信息
+        self.previous_scores = {
+            'collected': self.collected_score,
+            'penalty': self.penalty_score,
+            'final': self.final_score
+        }
+
+    def restart_game(self):
+        """重新开始游戏，刷新地图"""
+        self.grid = Grid()  # 重新生成障碍
+        self.action_points = 100
+        self.collected_score = 0
+        self.penalty_score = 0
+        self.final_score = 0
+        self.selected_tower_type = Cell.G
+        self.game_state = "playing"
+        self.needs_redraw = True
+
+    def handle_restart_click(self, pos):
+        """处理重新开始按钮点击"""
+        x, y = pos
+        btn_x, btn_y, btn_w, btn_h = RESTART_BTN_RECT
+        if btn_x <= x <= btn_x + btn_w and btn_y <= y <= btn_y + btn_h:
+            self.restart_game()
+            return True
+        return False
 
     def handle_remove(self, pos):
         cell = self.grid.get_cell_by_pixel(pos[0], pos[1] - HUD_H * HUD_LINES)
         if not cell:
             return
 
+        # 检查AP是否足够
+        if self.action_points < 1:
+            return
+
         # only remove tower
         if cell.type in (Cell.G, Cell.A, Cell.C):
             cell.type = Cell.EMPTY
             cell.level = 1
-            if self.action_points > 0:
-                self.action_points -= 1
+            self.action_points -= 1
             # 重新计算能量传播并更新得分
             self.update_scores()
+            # 检查是否需要进入结算界面
+            self.check_game_over()
 
     def render(self):
         self.screen.fill((20,20,20))
@@ -428,31 +508,40 @@ class Game:
 
     def draw_hud(self):
         font = pygame.font.SysFont(None, 24)
-        
+
         # 第一行：AP 和选中的塔
         pygame.draw.rect(self.screen, (30,30,30), (0, 0, WIDTH, HUD_H))
         name_map = {Cell.G: "Generator", Cell.A: "Amplifier", Cell.C: "Collector"}
         color_map = {Cell.G: (80, 160, 80), Cell.A: (80, 80, 180), Cell.C: (180, 120, 60)}
         t = self.selected_tower_type
-        
+
         base_txt = font.render(f"AP: {self.action_points} | selected: ", True, (220,220,220))
         self.screen.blit(base_txt, (10, 5))
-        
+
         offset_x = base_txt.get_width() + 10
         name_txt = font.render(name_map[t], True, color_map[t])
         self.screen.blit(name_txt, (offset_x, 5))
-        
+
+        # 重新开始按钮
+        btn_x, btn_y, btn_w, btn_h = RESTART_BTN_RECT
+        btn_color = (100, 100, 180) if self.game_state == "playing" else (60, 60, 100)
+        pygame.draw.rect(self.screen, btn_color, (btn_x, btn_y, btn_w, btn_h), border_radius=3)
+        pygame.draw.rect(self.screen, (150, 150, 200), (btn_x, btn_y, btn_w, btn_h), 1, border_radius=3)
+        btn_txt = font.render("重开", True, (255, 255, 255))
+        btn_rect = btn_txt.get_rect(center=(btn_x + btn_w // 2, btn_y + btn_h // 2))
+        self.screen.blit(btn_txt, btn_rect)
+
         # 第二行：得分信息
         pygame.draw.rect(self.screen, (25,25,25), (0, HUD_H, WIDTH, HUD_H))
-        
+
         offset_x = 10
         collected_txt = font.render(f"collected: {self.collected_score:.2f}", True, (100, 255, 100))
         self.screen.blit(collected_txt, (offset_x, HUD_H + 5))
-        
+
         offset_x += collected_txt.get_width() + 15
         penalty_txt = font.render(f"penalty: -{self.penalty_score:.2f}", True, (255, 100, 100))
         self.screen.blit(penalty_txt, (offset_x, HUD_H + 5))
-        
+
         offset_x += penalty_txt.get_width() + 15
         final_txt = font.render(f"final: {self.final_score:.2f}", True, (255, 255, 100))
         self.screen.blit(final_txt, (offset_x, HUD_H + 5))
