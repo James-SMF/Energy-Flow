@@ -30,15 +30,27 @@ class Grid:
                 break
             cell = self.cells[x][y]
             if cell.is_empty():
-                cell.set_obstacle()
-                count += 1
+                # 检查上下左右是否有障碍物
+                has_adjacent = False
+                directions = [(0, 1), (0, -1), (1, 0), (-1, 0)]
+                for dx, dy in directions:
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < self.size and 0 <= ny < self.size:
+                        if self.cells[nx][ny].is_obstacle():
+                            has_adjacent = True
+                            break
+                
+                # 如果没有相邻障碍物，则生成
+                if not has_adjacent:
+                    cell.set_obstacle()
+                    count += 1
 
-    def draw(self, screen):
+    def draw(self, screen, hud_offset=60):
         for x in range(self.size):
             for y in range(self.size):
                 cell = self.cells[x][y]
                 color = COLORS[cell.type]
-                rect = pygame.Rect(x*CELL_SIZE, y*CELL_SIZE + 40, CELL_SIZE, CELL_SIZE)
+                rect = pygame.Rect(x*CELL_SIZE, y*CELL_SIZE + hud_offset, CELL_SIZE, CELL_SIZE)
                 pygame.draw.rect(screen, color, rect)
                 pygame.draw.rect(screen, (70,70,70), rect, 1)
 
@@ -46,7 +58,7 @@ class Grid:
                 if cell.type in (Cell.G, Cell.A, Cell.C):
                     font = pygame.font.SysFont(None, 18)
                     lvl_txt = font.render(str(cell.level), True, (255, 255, 255))
-                    screen.blit(lvl_txt, (x*CELL_SIZE + 4, y*CELL_SIZE + 44))
+                    screen.blit(lvl_txt, (x*CELL_SIZE + 4, y*CELL_SIZE + hud_offset + 4))
 
                 # level display
                 if cell.type in (Cell.G, Cell.A, Cell.C):
@@ -55,12 +67,12 @@ class Grid:
                     ttxt = font2.render(letter, True, (240, 240, 240))
 
                     tx = x * CELL_SIZE + CELL_SIZE // 2 - ttxt.get_width() // 2
-                    ty = y * CELL_SIZE + 40 + CELL_SIZE // 2 - ttxt.get_height() // 2
+                    ty = y * CELL_SIZE + hud_offset + CELL_SIZE // 2 - ttxt.get_height() // 2
 
                     screen.blit(ttxt, (tx, ty))
 
         # 绘制能量传播线
-        self.draw_energy_lines(screen)
+        self.draw_energy_lines(screen, hud_offset)
 
     def get_cell_by_pixel(self, px, py):
         x = px // CELL_SIZE
@@ -70,40 +82,112 @@ class Grid:
         return None
 
     def calculate_energy_lines(self):
-        """计算所有 Generator 的能量传播路径"""
-        self.energy_lines = []
+        """计算所有 Generator 的能量传播路径，并计算得分"""
+        self.energy_lines = []  # 存储路径段，每段为 (路径坐标点列表, 是否已放大)
+        collected_energy = 0  # 收集的能量
+        wasted_energy = 0  # 浪费的能量
         
         for x in range(self.size):
             for y in range(self.size):
                 cell = self.cells[x][y]
                 if cell.type == Cell.G:
                     # 向四个方向发射能量
-                    self._propagate_energy(x, y, 0, 1)   # 下
-                    self._propagate_energy(x, y, 0, -1)  # 上
-                    self._propagate_energy(x, y, 1, 0)   # 右
-                    self._propagate_energy(x, y, -1, 0)  # 左
+                    base_energy = cell.get_base_energy()
+                    collected, wasted, segments = self._propagate_energy(x, y, 0, 1, base_energy)   # 下
+                    collected_energy += collected
+                    wasted_energy += wasted
+                    self.energy_lines.extend(segments)
+                    
+                    collected, wasted, segments = self._propagate_energy(x, y, 0, -1, base_energy)  # 上
+                    collected_energy += collected
+                    wasted_energy += wasted
+                    self.energy_lines.extend(segments)
+                    
+                    collected, wasted, segments = self._propagate_energy(x, y, 1, 0, base_energy)   # 右
+                    collected_energy += collected
+                    wasted_energy += wasted
+                    self.energy_lines.extend(segments)
+                    
+                    collected, wasted, segments = self._propagate_energy(x, y, -1, 0, base_energy)  # 左
+                    collected_energy += collected
+                    wasted_energy += wasted
+                    self.energy_lines.extend(segments)
+        
+        return (collected_energy, wasted_energy)
 
-    def _propagate_energy(self, start_x, start_y, dx, dy):
-        """从起点向指定方向传播能量，返回传播路径的所有坐标"""
-        path = [(start_x, start_y)]
+    def _propagate_energy(self, start_x, start_y, dx, dy, base_energy):
+        """
+        从起点向指定方向传播能量
+        返回: (收集的能量值, 浪费的能量值, 路径段列表)
+        每个路径段为 (坐标点列表, 是否已放大)
+        """
+        segments = []
+        collected_energy = 0
+        wasted_energy = 0
+        current_energy = base_energy
+        amplified = False
+        
+        current_segment = [(start_x, start_y)]
         x, y = start_x + dx, start_y + dy
         
         while 0 <= x < self.size and 0 <= y < self.size:
             cell = self.cells[x][y]
-            path.append((x, y))
             
-            # 遇到障碍物停止
+            # 遇到障碍物，添加边缘点后停止，能量浪费
             if cell.is_obstacle():
+                # 计算障碍物边缘的坐标（相对于网格单元的边缘）
+                edge_x = x - dx * 0.5
+                edge_y = y - dy * 0.5
+                current_segment.append((edge_x, edge_y))
+                # 能量没有被收集，算作浪费
+                wasted_energy += current_energy
+                break
+            
+            # 将当前格子加入当前段
+            current_segment.append((x, y))
+            
+            # 遇到其他塔
+            if cell.type == Cell.A:
+                # 放大能量为 n 倍（使用塔的放大倍数），可穿透
+                current_energy *= cell.get_amplifier_multiplier()
+                # 保存当前段（未放大的）
+                segments.append((current_segment, False))
+                # 开始新的一段（已放大的）
+                current_segment = [(x, y)]
+                amplified = True
+            elif cell.type == Cell.C:
+                # 收集能量，使用收集效率
+                collected_energy += current_energy * cell.get_collector_efficiency()
+                # 保存当前段
+                segments.append((current_segment, amplified))
+                break
+            elif cell.type == Cell.G:
+                # 遇到另一个 Generator，停止传播，能量不算浪费（被另一个G吸收）
+                # 保存当前段
+                segments.append((current_segment, amplified))
                 break
             
             x += dx
             y += dy
         
-        self.energy_lines.append(path)
+        # 检查是否到达墙壁（边界），能量浪费
+        if not (0 <= x < self.size and 0 <= y < self.size):
+            # 添加墙壁边缘点
+            edge_x = x - dx * 0.5
+            edge_y = y - dy * 0.5
+            current_segment.append((edge_x, edge_y))
+            # 能量没有被收集，算作浪费
+            wasted_energy += current_energy
+        
+        # 如果循环正常结束，保存最后一段
+        if current_segment and not (segments and segments[-1][0] == current_segment and segments[-1][1] == amplified):
+            segments.append((current_segment, amplified))
+        
+        return (collected_energy, wasted_energy, segments)
 
-    def draw_energy_lines(self, screen):
-        """绘制能量传播线"""
-        for path in self.energy_lines:
+    def draw_energy_lines(self, screen, hud_offset=60):
+        """绘制能量传播线，带有动态效果和分段放大效果"""
+        for path, amplified in self.energy_lines:
             if len(path) < 2:
                 continue
             
@@ -111,12 +195,32 @@ class Grid:
             points = []
             for x, y in path:
                 px = x * CELL_SIZE + CELL_SIZE // 2
-                py = y * CELL_SIZE + 40 + CELL_SIZE // 2
+                py = y * CELL_SIZE + hud_offset + CELL_SIZE // 2
                 points.append((px, py))
             
-            # 绘制能量线（使用绿色发光效果）
+            # 根据是否已放大选择线宽
+            if amplified:
+                outer_width = 16
+                mid_width = 10
+                inner_width = 4
+            else:
+                outer_width = 8
+                mid_width = 4
+                inner_width = 2
+            
+            # 绘制能量线（使用渐变绿色发光效果）
             if len(points) >= 2:
-                # 外发光
-                pygame.draw.lines(screen, (100, 200, 100), False, points, 6)
-                # 内层亮线
-                pygame.draw.lines(screen, (200, 255, 200), False, points, 3)
+                # 外发光（绿色）
+                pygame.draw.lines(screen, (50, 180, 50), False, points, outer_width)
+                # 中层（亮绿）
+                pygame.draw.lines(screen, (100, 255, 100), False, points, mid_width)
+                # 内层（高亮白）
+                pygame.draw.lines(screen, (220, 255, 220), False, points, inner_width)
+                
+                # 在线段端点绘制能量光点（跳过边缘点）
+                for i, (px, py) in enumerate(points):
+                    # 检查是否是边缘点（坐标不是整数）
+                    orig_x, orig_y = path[i]
+                    if orig_x == int(orig_x) and orig_y == int(orig_y):
+                        pygame.draw.circle(screen, (150, 255, 150), (px, py), 4)
+                        pygame.draw.circle(screen, (255, 255, 255), (px, py), 2)
